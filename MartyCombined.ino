@@ -1,166 +1,183 @@
 #include <AFMotor.h>
 #include <Wire.h>
 
-// Marty Combined v2 with start/stop buttons
-#define STOP_PIN A14
-#define START_PIN A15
+// This sketch blends Henry's drink routine with Marty button control using
+// verbose names and comments so each action is easy to follow.
 
-AF_DCMotor Dpump(2);
-AF_DCMotor Ppump(1);
-AF_DCMotor Impmotor(4);
-AF_DCMotor Pressmotor(3);
+// Marty Combined v2 with start/stop buttons
+const byte STOP_BUTTON_PIN = A14;  // wired stop button that pauses everything
+const byte START_BUTTON_PIN = A15; // wired start button that resumes the cycle
+
+// Motor objects are created with descriptive names so wiring is obvious.
+AF_DCMotor diaphragmPumpMotor(2);
+AF_DCMotor peristalticPumpMotor(1);
+AF_DCMotor impellerMotor(4);
+AF_DCMotor pressMotor(3);
 
 const byte RELAY_PIN = 53;
 const byte STEP_COUNT = 15;
 
-// Durations for each step (ms)
+// Durations for each numbered step (milliseconds) listed in execution order.
 const unsigned long stepTime[STEP_COUNT] = {
-  10000, // diaphragm run
-  0,     // diaphragm release
-  2000,  // wait
-  5000,  // peri run
-  0,     // peri release
-  2000,  // wait
-  10000, // imp fast
-  10000, // imp slow
-  0,     // imp release
-  2000,  // wait
-  20000, // press run
-  0,     // press release
-  2000,  // wait
-  8000,  // relay on
-  0      // relay off
+  10000, // Step 0  - diaphragm pump runs
+  0,     // Step 1  - diaphragm pump releases
+  2000,  // Step 2  - wait so fluid settles
+  5000,  // Step 3  - peristaltic pump runs
+  0,     // Step 4  - peristaltic pump releases
+  2000,  // Step 5  - wait before impeller work
+  10000, // Step 6  - impeller fast mix
+  10000, // Step 7  - impeller slow mix
+  0,     // Step 8  - impeller releases
+  2000,  // Step 9  - wait so foam can drop
+  20000, // Step 10 - press motor runs
+  0,     // Step 11 - press motor releases
+  2000,  // Step 12 - wait before relay action
+  8000,  // Step 13 - relay energizes
+  0      // Step 14 - relay turns off
 };
 
-byte stepIndex = 255;      // current step (255 = idle)
-bool running = false;      // true when sequence is active
-unsigned long stepStart = 0;
-unsigned long pauseOffset = 0;
+byte currentStepIndex = 255;        // 255 means idle before the first run
+bool processRunning = false;        // true while the drink sequence advances
+unsigned long stepStartTime = 0;    // timestamp when the current step began
+unsigned long pausedElapsedTime = 0;// time already spent in a paused step
 
-void startSystem();       // start or resume sequence
-void stopSystem();        // pause sequence
-void updateProcess();     // timing engine
-void enterStep(byte idx); // start a step
-void applyStep(byte idx); // drive hardware for a step
-void stopAllActuators();  // release everything
+void startSystem();        // starts or resumes the drink sequence
+void stopSystem();         // pauses the sequence and releases hardware
+void updateProcess();      // checks timers and advances steps
+void enterStep(byte idx);  // sets the timer for a new step
+void applyStep(byte idx);  // drives the hardware for a specific step
+void stopAllActuators();   // turns every motor and relay off
 
 void setup() {
   Serial.begin(9600);
   Serial.println("Hi! I'm MARTY, hope you're thirsty");
 
-  pinMode(STOP_PIN, INPUT_PULLUP);
-  pinMode(START_PIN, INPUT_PULLUP);
+  // Configure buttons as pull-ups so they read LOW when pressed.
+  pinMode(STOP_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(START_BUTTON_PIN, INPUT_PULLUP);
+
+  // Prep the relay output so the accessory stays off until needed.
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
 
+  // Begin with every actuator released for safety.
   stopAllActuators();
 }
 
 void loop() {
-  if (digitalRead(STOP_PIN) == LOW) {
+  // Buttons are checked every pass; pressing Stop has priority.
+  if (digitalRead(STOP_BUTTON_PIN) == LOW) {
     stopSystem();
-  } else if (digitalRead(START_PIN) == LOW) {
+  } else if (digitalRead(START_BUTTON_PIN) == LOW) {
     startSystem();
   }
 
+  // Advance the routine only when timing allows.
   updateProcess();
 }
 
-void startSystem() { // starts or resumes the drink cycle
-  if (stepIndex >= STEP_COUNT) {
-    stepIndex = 0;
-    pauseOffset = 0;
+// startSystem starts or resumes the drink cycle at the stored step index.
+void startSystem() {
+  if (currentStepIndex >= STEP_COUNT) {
+    currentStepIndex = 0;
+    pausedElapsedTime = 0;
   }
 
-  if (!running) {
-    running = true;
-    if (pauseOffset == 0) {
-      if (stepIndex == 255) {
-        stepIndex = 0;
+  if (!processRunning) {
+    processRunning = true;
+    if (pausedElapsedTime == 0) {
+      if (currentStepIndex == 255) {
+        currentStepIndex = 0;
       }
       Serial.println("System starting.");
-      enterStep(stepIndex);
+      enterStep(currentStepIndex);
     } else {
-      stepStart = millis() - pauseOffset;
-      pauseOffset = 0;
-      applyStep(stepIndex);
+      // Recreate the partially completed timer so the step finishes naturally.
+      stepStartTime = millis() - pausedElapsedTime;
+      pausedElapsedTime = 0;
+      applyStep(currentStepIndex);
       Serial.println("System resuming.");
     }
   }
 }
 
-void stopSystem() { // pauses the cycle and releases hardware
-  if (running) {
-    pauseOffset = millis() - stepStart;
+// stopSystem freezes the timer and drops power to every actuator.
+void stopSystem() {
+  if (processRunning) {
+    pausedElapsedTime = millis() - stepStartTime;
   }
-  running = false;
+  processRunning = false;
   stopAllActuators();
   Serial.println("System stopped.");
 }
 
-void updateProcess() { // advances steps when time expires
-  if (!running || stepIndex >= STEP_COUNT) {
+// updateProcess compares elapsed time to the configured duration and advances.
+void updateProcess() {
+  if (!processRunning || currentStepIndex >= STEP_COUNT) {
     return;
   }
 
-  unsigned long duration = stepTime[stepIndex];
-  if (duration == 0 || millis() - stepStart >= duration) {
-    stepIndex++;
-    if (stepIndex >= STEP_COUNT) {
-      running = false;
+  unsigned long duration = stepTime[currentStepIndex];
+  // Duration of zero means "instant" steps such as motor releases.
+  if (duration == 0 || millis() - stepStartTime >= duration) {
+    currentStepIndex++;
+    if (currentStepIndex >= STEP_COUNT) {
+      processRunning = false;
       stopAllActuators();
       Serial.println("All done! Drink up :)");
     } else {
-      enterStep(stepIndex);
+      enterStep(currentStepIndex);
     }
   }
 }
 
-void enterStep(byte idx) { // initializes a step timer
-  stepIndex = idx;
-  stepStart = millis();
-  pauseOffset = 0;
+// enterStep records the new step index and restarts the timer reference.
+void enterStep(byte idx) {
+  currentStepIndex = idx;
+  stepStartTime = millis();
+  pausedElapsedTime = 0;
   applyStep(idx);
 }
 
-void applyStep(byte idx) { // performs the hardware action for a step
+// applyStep energizes or releases the actuator assigned to the provided step.
+void applyStep(byte idx) {
   switch (idx) {
     case 0:
-      Dpump.setSpeed(255);
-      Dpump.run(FORWARD);
+      diaphragmPumpMotor.setSpeed(255);
+      diaphragmPumpMotor.run(FORWARD);
       Serial.println("Diaphragm pump on.");
       break;
     case 1:
-      Dpump.run(RELEASE);
+      diaphragmPumpMotor.run(RELEASE);
       break;
     case 3:
-      Ppump.setSpeed(255);
-      Ppump.run(FORWARD);
+      peristalticPumpMotor.setSpeed(255);
+      peristalticPumpMotor.run(FORWARD);
       Serial.println("Peri pump on.");
       break;
     case 4:
-      Ppump.run(RELEASE);
+      peristalticPumpMotor.run(RELEASE);
       break;
     case 6:
-      Impmotor.setSpeed(180);
-      Impmotor.run(FORWARD);
+      impellerMotor.setSpeed(180);
+      impellerMotor.run(FORWARD);
       Serial.println("Imp fast.");
       break;
     case 7:
-      Impmotor.setSpeed(100);
-      Impmotor.run(FORWARD);
+      impellerMotor.setSpeed(100);
+      impellerMotor.run(FORWARD);
       Serial.println("Imp slow.");
       break;
     case 8:
-      Impmotor.run(RELEASE);
+      impellerMotor.run(RELEASE);
       break;
     case 10:
-      Pressmotor.setSpeed(180);
-      Pressmotor.run(FORWARD);
+      pressMotor.setSpeed(180);
+      pressMotor.run(FORWARD);
       Serial.println("Press motor on.");
       break;
     case 11:
-      Pressmotor.run(RELEASE);
+      pressMotor.run(RELEASE);
       break;
     case 13:
       digitalWrite(RELAY_PIN, HIGH);
@@ -171,15 +188,17 @@ void applyStep(byte idx) { // performs the hardware action for a step
       Serial.println("Relay off.");
       break;
     default:
+      // Waiting steps fall through here so everything remains released.
       stopAllActuators();
       break;
   }
 }
 
-void stopAllActuators() { // releases pumps, motors, and relay
-  Dpump.run(RELEASE);
-  Ppump.run(RELEASE);
-  Impmotor.run(RELEASE);
-  Pressmotor.run(RELEASE);
+// stopAllActuators guarantees every motor and the relay are released.
+void stopAllActuators() {
+  diaphragmPumpMotor.run(RELEASE);
+  peristalticPumpMotor.run(RELEASE);
+  impellerMotor.run(RELEASE);
+  pressMotor.run(RELEASE);
   digitalWrite(RELAY_PIN, LOW);
 }
